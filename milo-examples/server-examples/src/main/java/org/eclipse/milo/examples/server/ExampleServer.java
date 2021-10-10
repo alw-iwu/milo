@@ -26,6 +26,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.eclipse.milo.opcua.sdk.client.OpcUaClient;
 import org.eclipse.milo.opcua.sdk.server.OpcUaServer;
 import org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig;
 import org.eclipse.milo.opcua.sdk.server.identity.CompositeValidator;
@@ -54,11 +55,13 @@ import static com.google.common.collect.Lists.newArrayList;
 import static org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig.USER_TOKEN_POLICY_ANONYMOUS;
 import static org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig.USER_TOKEN_POLICY_USERNAME;
 import static org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig.USER_TOKEN_POLICY_X509;
+import static org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.uint;
 
 public class ExampleServer {
 
     private static final int TCP_BIND_PORT = 12686;
     private static final int HTTPS_BIND_PORT = 8443;
+    private static final String CLIENT_TCP_ENDPOINT = "opc.tcp://opcuademo.sterfive.com:26543";
 
     static {
         // Required for SecurityPolicy.Aes256_Sha256_RsaPss
@@ -70,6 +73,97 @@ public class ExampleServer {
             e.printStackTrace();
             System.exit(-1);
         }
+    }
+
+    private final OpcUaServer server;
+    private final ExampleNamespace exampleNamespace;
+    public ExampleServer() throws Exception {
+        Path securityTempDir = Paths.get(System.getProperty("java.io.tmpdir"), "server", "security");
+        Files.createDirectories(securityTempDir);
+        if (!Files.exists(securityTempDir)) {
+            throw new Exception("unable to create security temp dir: " + securityTempDir);
+        }
+
+        File pkiDir = securityTempDir.resolve("pki").toFile();
+
+        LoggerFactory.getLogger(getClass())
+                .info("security dir: {}", securityTempDir.toAbsolutePath());
+        LoggerFactory.getLogger(getClass())
+                .info("security pki dir: {}", pkiDir.getAbsolutePath());
+
+        KeyStoreLoader loader = new KeyStoreLoader().load(securityTempDir);
+
+        DefaultCertificateManager certificateManager = new DefaultCertificateManager(
+                loader.getServerKeyPair(),
+                loader.getServerCertificateChain()
+        );
+
+        DefaultTrustListManager trustListManager = new DefaultTrustListManager(pkiDir);
+
+        DefaultServerCertificateValidator certificateValidator =
+                new DefaultServerCertificateValidator(trustListManager);
+
+        KeyPair httpsKeyPair = SelfSignedCertificateGenerator.generateRsaKeyPair(2048);
+
+        SelfSignedHttpsCertificateBuilder httpsCertificateBuilder = new SelfSignedHttpsCertificateBuilder(httpsKeyPair);
+        httpsCertificateBuilder.setCommonName(HostnameUtil.getHostname());
+        HostnameUtil.getHostnames("0.0.0.0").forEach(httpsCertificateBuilder::addDnsName);
+        X509Certificate httpsCertificate = httpsCertificateBuilder.build();
+
+        UsernameIdentityValidator identityValidator = new UsernameIdentityValidator(
+                true,
+                authChallenge -> {
+                    String username = authChallenge.getUsername();
+                    String password = authChallenge.getPassword();
+
+                    boolean userOk = "user".equals(username) && "password1".equals(password);
+                    boolean adminOk = "admin".equals(username) && "password2".equals(password);
+
+                    return userOk || adminOk;
+                }
+        );
+
+        X509IdentityValidator x509IdentityValidator = new X509IdentityValidator(c -> true);
+
+        // If you need to use multiple certificates you'll have to be smarter than this.
+        X509Certificate certificate = certificateManager.getCertificates()
+                .stream()
+                .findFirst()
+                .orElseThrow(() -> new UaRuntimeException(StatusCodes.Bad_ConfigurationError, "no certificate found"));
+
+        // The configured application URI must match the one in the certificate(s)
+        String applicationUri = CertificateUtil
+                .getSanUri(certificate)
+                .orElseThrow(() -> new UaRuntimeException(
+                        StatusCodes.Bad_ConfigurationError,
+                        "certificate is missing the application URI"));
+
+        Set<EndpointConfiguration> endpointConfigurations = createEndpointConfigurations(certificate);
+
+        OpcUaServerConfig serverConfig = OpcUaServerConfig.builder()
+                .setApplicationUri(applicationUri)
+                .setApplicationName(LocalizedText.english("Eclipse Milo OPC UA Example Server"))
+                .setEndpoints(endpointConfigurations)
+                .setBuildInfo(
+                        new BuildInfo(
+                                "urn:eclipse:milo:example-server",
+                                "eclipse",
+                                "eclipse milo example server",
+                                OpcUaServer.SDK_VERSION,
+                                "", DateTime.now()))
+                .setCertificateManager(certificateManager)
+                .setTrustListManager(trustListManager)
+                .setCertificateValidator(certificateValidator)
+                .setHttpsKeyPair(httpsKeyPair)
+                .setHttpsCertificate(httpsCertificate)
+                .setIdentityValidator(new CompositeValidator(identityValidator, x509IdentityValidator))
+                .setProductUri("urn:eclipse:milo:example-server")
+                .build();
+
+        server = new OpcUaServer(serverConfig);
+
+        exampleNamespace = new ExampleNamespace(server, OpcUaClient.create(CLIENT_TCP_ENDPOINT));
+        exampleNamespace.startup();
     }
 
     public static void main(String[] args) throws Exception {
@@ -84,96 +178,18 @@ public class ExampleServer {
         future.get();
     }
 
-    private final OpcUaServer server;
-    private final ExampleNamespace exampleNamespace;
+    private static EndpointConfiguration buildTcpEndpoint(EndpointConfiguration.Builder base) {
+        return base.copy()
+                .setTransportProfile(TransportProfile.TCP_UASC_UABINARY)
+                .setBindPort(TCP_BIND_PORT)
+                .build();
+    }
 
-    public ExampleServer() throws Exception {
-        Path securityTempDir = Paths.get(System.getProperty("java.io.tmpdir"), "server", "security");
-        Files.createDirectories(securityTempDir);
-        if (!Files.exists(securityTempDir)) {
-            throw new Exception("unable to create security temp dir: " + securityTempDir);
-        }
-
-        File pkiDir = securityTempDir.resolve("pki").toFile();
-
-        LoggerFactory.getLogger(getClass())
-            .info("security dir: {}", securityTempDir.toAbsolutePath());
-        LoggerFactory.getLogger(getClass())
-            .info("security pki dir: {}", pkiDir.getAbsolutePath());
-
-        KeyStoreLoader loader = new KeyStoreLoader().load(securityTempDir);
-
-        DefaultCertificateManager certificateManager = new DefaultCertificateManager(
-            loader.getServerKeyPair(),
-            loader.getServerCertificateChain()
-        );
-
-        DefaultTrustListManager trustListManager = new DefaultTrustListManager(pkiDir);
-
-        DefaultServerCertificateValidator certificateValidator =
-            new DefaultServerCertificateValidator(trustListManager);
-
-        KeyPair httpsKeyPair = SelfSignedCertificateGenerator.generateRsaKeyPair(2048);
-
-        SelfSignedHttpsCertificateBuilder httpsCertificateBuilder = new SelfSignedHttpsCertificateBuilder(httpsKeyPair);
-        httpsCertificateBuilder.setCommonName(HostnameUtil.getHostname());
-        HostnameUtil.getHostnames("0.0.0.0").forEach(httpsCertificateBuilder::addDnsName);
-        X509Certificate httpsCertificate = httpsCertificateBuilder.build();
-
-        UsernameIdentityValidator identityValidator = new UsernameIdentityValidator(
-            true,
-            authChallenge -> {
-                String username = authChallenge.getUsername();
-                String password = authChallenge.getPassword();
-
-                boolean userOk = "user".equals(username) && "password1".equals(password);
-                boolean adminOk = "admin".equals(username) && "password2".equals(password);
-
-                return userOk || adminOk;
-            }
-        );
-
-        X509IdentityValidator x509IdentityValidator = new X509IdentityValidator(c -> true);
-
-        // If you need to use multiple certificates you'll have to be smarter than this.
-        X509Certificate certificate = certificateManager.getCertificates()
-            .stream()
-            .findFirst()
-            .orElseThrow(() -> new UaRuntimeException(StatusCodes.Bad_ConfigurationError, "no certificate found"));
-
-        // The configured application URI must match the one in the certificate(s)
-        String applicationUri = CertificateUtil
-            .getSanUri(certificate)
-            .orElseThrow(() -> new UaRuntimeException(
-                StatusCodes.Bad_ConfigurationError,
-                "certificate is missing the application URI"));
-
-        Set<EndpointConfiguration> endpointConfigurations = createEndpointConfigurations(certificate);
-
-        OpcUaServerConfig serverConfig = OpcUaServerConfig.builder()
-            .setApplicationUri(applicationUri)
-            .setApplicationName(LocalizedText.english("Eclipse Milo OPC UA Example Server"))
-            .setEndpoints(endpointConfigurations)
-            .setBuildInfo(
-                new BuildInfo(
-                    "urn:eclipse:milo:example-server",
-                    "eclipse",
-                    "eclipse milo example server",
-                    OpcUaServer.SDK_VERSION,
-                    "", DateTime.now()))
-            .setCertificateManager(certificateManager)
-            .setTrustListManager(trustListManager)
-            .setCertificateValidator(certificateValidator)
-            .setHttpsKeyPair(httpsKeyPair)
-            .setHttpsCertificate(httpsCertificate)
-            .setIdentityValidator(new CompositeValidator(identityValidator, x509IdentityValidator))
-            .setProductUri("urn:eclipse:milo:example-server")
-            .build();
-
-        server = new OpcUaServer(serverConfig);
-
-        exampleNamespace = new ExampleNamespace(server);
-        exampleNamespace.startup();
+    private static EndpointConfiguration buildHttpsEndpoint(EndpointConfiguration.Builder base) {
+        return base.copy()
+                .setTransportProfile(TransportProfile.HTTPS_UABINARY)
+                .setBindPort(HTTPS_BIND_PORT)
+                .build();
     }
 
     private Set<EndpointConfiguration> createEndpointConfigurations(X509Certificate certificate) {
@@ -189,35 +205,35 @@ public class ExampleServer {
         for (String bindAddress : bindAddresses) {
             for (String hostname : hostnames) {
                 EndpointConfiguration.Builder builder = EndpointConfiguration.newBuilder()
-                    .setBindAddress(bindAddress)
-                    .setHostname(hostname)
-                    .setPath("/milo")
-                    .setCertificate(certificate)
-                    .addTokenPolicies(
-                        USER_TOKEN_POLICY_ANONYMOUS,
-                        USER_TOKEN_POLICY_USERNAME,
-                        USER_TOKEN_POLICY_X509);
+                        .setBindAddress(bindAddress)
+                        .setHostname(hostname)
+                        .setPath("/milo")
+                        .setCertificate(certificate)
+                        .addTokenPolicies(
+                                USER_TOKEN_POLICY_ANONYMOUS,
+                                USER_TOKEN_POLICY_USERNAME,
+                                USER_TOKEN_POLICY_X509);
 
 
                 EndpointConfiguration.Builder noSecurityBuilder = builder.copy()
-                    .setSecurityPolicy(SecurityPolicy.None)
-                    .setSecurityMode(MessageSecurityMode.None);
+                        .setSecurityPolicy(SecurityPolicy.None)
+                        .setSecurityMode(MessageSecurityMode.None);
 
                 endpointConfigurations.add(buildTcpEndpoint(noSecurityBuilder));
                 endpointConfigurations.add(buildHttpsEndpoint(noSecurityBuilder));
 
                 // TCP Basic256Sha256 / SignAndEncrypt
                 endpointConfigurations.add(buildTcpEndpoint(
-                    builder.copy()
-                        .setSecurityPolicy(SecurityPolicy.Basic256Sha256)
-                        .setSecurityMode(MessageSecurityMode.SignAndEncrypt))
+                        builder.copy()
+                                .setSecurityPolicy(SecurityPolicy.Basic256Sha256)
+                                .setSecurityMode(MessageSecurityMode.SignAndEncrypt))
                 );
 
                 // HTTPS Basic256Sha256 / Sign (SignAndEncrypt not allowed for HTTPS)
                 endpointConfigurations.add(buildHttpsEndpoint(
-                    builder.copy()
-                        .setSecurityPolicy(SecurityPolicy.Basic256Sha256)
-                        .setSecurityMode(MessageSecurityMode.Sign))
+                        builder.copy()
+                                .setSecurityPolicy(SecurityPolicy.Basic256Sha256)
+                                .setSecurityMode(MessageSecurityMode.Sign))
                 );
 
                 /*
@@ -232,9 +248,9 @@ public class ExampleServer {
                  */
 
                 EndpointConfiguration.Builder discoveryBuilder = builder.copy()
-                    .setPath("/milo/discovery")
-                    .setSecurityPolicy(SecurityPolicy.None)
-                    .setSecurityMode(MessageSecurityMode.None);
+                        .setPath("/milo/discovery")
+                        .setSecurityPolicy(SecurityPolicy.None)
+                        .setSecurityMode(MessageSecurityMode.None);
 
                 endpointConfigurations.add(buildTcpEndpoint(discoveryBuilder));
                 endpointConfigurations.add(buildHttpsEndpoint(discoveryBuilder));
@@ -242,20 +258,6 @@ public class ExampleServer {
         }
 
         return endpointConfigurations;
-    }
-
-    private static EndpointConfiguration buildTcpEndpoint(EndpointConfiguration.Builder base) {
-        return base.copy()
-            .setTransportProfile(TransportProfile.TCP_UASC_UABINARY)
-            .setBindPort(TCP_BIND_PORT)
-            .build();
-    }
-
-    private static EndpointConfiguration buildHttpsEndpoint(EndpointConfiguration.Builder base) {
-        return base.copy()
-            .setTransportProfile(TransportProfile.HTTPS_UABINARY)
-            .setBindPort(HTTPS_BIND_PORT)
-            .build();
     }
 
     public OpcUaServer getServer() {

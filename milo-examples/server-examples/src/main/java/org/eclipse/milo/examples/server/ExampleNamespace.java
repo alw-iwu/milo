@@ -10,60 +10,37 @@
 
 package org.eclipse.milo.examples.server;
 
-import java.lang.reflect.Array;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 
-import org.eclipse.milo.examples.server.methods.GenerateEventMethod;
-import org.eclipse.milo.examples.server.methods.SqrtMethod;
-import org.eclipse.milo.examples.server.types.CustomEnumType;
-import org.eclipse.milo.examples.server.types.CustomStructType;
-import org.eclipse.milo.examples.server.types.CustomUnionType;
+import org.eclipse.milo.opcua.sdk.client.OpcUaClient;
 import org.eclipse.milo.opcua.sdk.core.AccessLevel;
 import org.eclipse.milo.opcua.sdk.core.Reference;
-import org.eclipse.milo.opcua.sdk.core.ValueRank;
-import org.eclipse.milo.opcua.sdk.core.ValueRanks;
 import org.eclipse.milo.opcua.sdk.server.Lifecycle;
 import org.eclipse.milo.opcua.sdk.server.OpcUaServer;
 import org.eclipse.milo.opcua.sdk.server.api.DataItem;
 import org.eclipse.milo.opcua.sdk.server.api.ManagedNamespaceWithLifecycle;
 import org.eclipse.milo.opcua.sdk.server.api.MonitoredItem;
 import org.eclipse.milo.opcua.sdk.server.dtd.DataTypeDictionaryManager;
-import org.eclipse.milo.opcua.sdk.server.model.nodes.objects.BaseEventTypeNode;
-import org.eclipse.milo.opcua.sdk.server.model.nodes.objects.ServerTypeNode;
-import org.eclipse.milo.opcua.sdk.server.model.nodes.variables.AnalogItemTypeNode;
 import org.eclipse.milo.opcua.sdk.server.nodes.UaFolderNode;
-import org.eclipse.milo.opcua.sdk.server.nodes.UaMethodNode;
-import org.eclipse.milo.opcua.sdk.server.nodes.UaNode;
 import org.eclipse.milo.opcua.sdk.server.nodes.UaObjectNode;
 import org.eclipse.milo.opcua.sdk.server.nodes.UaObjectTypeNode;
 import org.eclipse.milo.opcua.sdk.server.nodes.UaVariableNode;
-import org.eclipse.milo.opcua.sdk.server.nodes.factories.NodeFactory;
 import org.eclipse.milo.opcua.sdk.server.nodes.filters.AttributeFilters;
 import org.eclipse.milo.opcua.sdk.server.util.SubscriptionModel;
-import org.eclipse.milo.opcua.stack.core.AttributeId;
-import org.eclipse.milo.opcua.stack.core.BuiltinDataType;
 import org.eclipse.milo.opcua.stack.core.Identifiers;
 import org.eclipse.milo.opcua.stack.core.UaException;
 import org.eclipse.milo.opcua.stack.core.types.builtin.ByteString;
 import org.eclipse.milo.opcua.stack.core.types.builtin.DataValue;
 import org.eclipse.milo.opcua.stack.core.types.builtin.DateTime;
-import org.eclipse.milo.opcua.stack.core.types.builtin.ExtensionObject;
 import org.eclipse.milo.opcua.stack.core.types.builtin.LocalizedText;
 import org.eclipse.milo.opcua.stack.core.types.builtin.NodeId;
 import org.eclipse.milo.opcua.stack.core.types.builtin.QualifiedName;
 import org.eclipse.milo.opcua.stack.core.types.builtin.Variant;
 import org.eclipse.milo.opcua.stack.core.types.builtin.XmlElement;
-import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UInteger;
-import org.eclipse.milo.opcua.stack.core.types.enumerated.StructureType;
-import org.eclipse.milo.opcua.stack.core.types.structured.EnumDefinition;
-import org.eclipse.milo.opcua.stack.core.types.structured.EnumDescription;
-import org.eclipse.milo.opcua.stack.core.types.structured.EnumField;
-import org.eclipse.milo.opcua.stack.core.types.structured.Range;
-import org.eclipse.milo.opcua.stack.core.types.structured.StructureDefinition;
-import org.eclipse.milo.opcua.stack.core.types.structured.StructureDescription;
-import org.eclipse.milo.opcua.stack.core.types.structured.StructureField;
+import org.eclipse.milo.opcua.stack.core.types.enumerated.TimestampsToReturn;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -131,14 +108,17 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
     private volatile Thread eventThread;
     private volatile boolean keepPostingEvents = true;
 
-    private final Random random = new Random();
+    private final OpcUaClient client;
 
     private final DataTypeDictionaryManager dictionaryManager;
 
     private final SubscriptionModel subscriptionModel;
 
-    ExampleNamespace(OpcUaServer server) {
+    ExampleNamespace(OpcUaServer server, OpcUaClient client) {
         super(server, NAMESPACE_URI);
+        this.client = client;
+
+        client.connect();
 
         subscriptionModel = new SubscriptionModel(server, this);
         dictionaryManager = new DataTypeDictionaryManager(getNodeContext(), NAMESPACE_URI);
@@ -151,13 +131,14 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
         getLifecycleManager().addLifecycle(new Lifecycle() {
             @Override
             public void startup() {
-                startBogusEventNotifier();
+
             }
 
             @Override
             public void shutdown() {
                 try {
                     keepPostingEvents = false;
+                    client.disconnect();
                     eventThread.interrupt();
                     eventThread.join();
                 } catch (InterruptedException ignored) {
@@ -191,273 +172,11 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
         // Add the rest of the nodes
         addVariableNodes(folderNode);
 
-        addSqrtMethod(folderNode);
-
-        addGenerateEventMethod(folderNode);
-
-        try {
-            registerCustomEnumType();
-            addCustomEnumTypeVariable(folderNode);
-        } catch (Exception e) {
-            logger.warn("Failed to register custom enum type", e);
-        }
-
-        try {
-            registerCustomStructType();
-            addCustomStructTypeVariable(folderNode);
-        } catch (Exception e) {
-            logger.warn("Failed to register custom struct type", e);
-        }
-
-        try {
-            registerCustomUnionType();
-            addCustomUnionTypeVariable(folderNode);
-        } catch (Exception e) {
-            logger.warn("Failed to register custom struct type", e);
-        }
-
         addCustomObjectTypeAndInstance(folderNode);
     }
 
-    private void startBogusEventNotifier() {
-        // Set the EventNotifier bit on Server Node for Events.
-        UaNode serverNode = getServer()
-            .getAddressSpaceManager()
-            .getManagedNode(Identifiers.Server)
-            .orElse(null);
-
-        if (serverNode instanceof ServerTypeNode) {
-            ((ServerTypeNode) serverNode).setEventNotifier(ubyte(1));
-
-            // Post a bogus Event every couple seconds
-            eventThread = new Thread(() -> {
-                while (keepPostingEvents) {
-                    try {
-                        BaseEventTypeNode eventNode = getServer().getEventFactory().createEvent(
-                            newNodeId(UUID.randomUUID()),
-                            Identifiers.BaseEventType
-                        );
-
-                        eventNode.setBrowseName(new QualifiedName(1, "foo"));
-                        eventNode.setDisplayName(LocalizedText.english("foo"));
-                        eventNode.setEventId(ByteString.of(new byte[]{0, 1, 2, 3}));
-                        eventNode.setEventType(Identifiers.BaseEventType);
-                        eventNode.setSourceNode(serverNode.getNodeId());
-                        eventNode.setSourceName(serverNode.getDisplayName().getText());
-                        eventNode.setTime(DateTime.now());
-                        eventNode.setReceiveTime(DateTime.NULL_VALUE);
-                        eventNode.setMessage(LocalizedText.english("event message!"));
-                        eventNode.setSeverity(ushort(2));
-
-                        //noinspection UnstableApiUsage
-                        getServer().getEventBus().post(eventNode);
-
-                        eventNode.delete();
-                    } catch (Throwable e) {
-                        logger.error("Error creating EventNode: {}", e.getMessage(), e);
-                    }
-
-                    try {
-                        //noinspection BusyWait
-                        Thread.sleep(2_000);
-                    } catch (InterruptedException ignored) {
-                        // ignored
-                    }
-                }
-            }, "bogus-event-poster");
-
-            eventThread.start();
-        }
-    }
-
     private void addVariableNodes(UaFolderNode rootNode) {
-        addArrayNodes(rootNode);
-        addScalarNodes(rootNode);
-        addAdminReadableNodes(rootNode);
-        addAdminWritableNodes(rootNode);
         addDynamicNodes(rootNode);
-        addDataAccessNodes(rootNode);
-        addWriteOnlyNodes(rootNode);
-    }
-
-    private void addArrayNodes(UaFolderNode rootNode) {
-        UaFolderNode arrayTypesFolder = new UaFolderNode(
-            getNodeContext(),
-            newNodeId("HelloWorld/ArrayTypes"),
-            newQualifiedName("ArrayTypes"),
-            LocalizedText.english("ArrayTypes")
-        );
-
-        getNodeManager().addNode(arrayTypesFolder);
-        rootNode.addOrganizes(arrayTypesFolder);
-
-        for (Object[] os : STATIC_ARRAY_NODES) {
-            String name = (String) os[0];
-            NodeId typeId = (NodeId) os[1];
-            Object value = os[2];
-            Object array = Array.newInstance(value.getClass(), 5);
-            for (int i = 0; i < 5; i++) {
-                Array.set(array, i, value);
-            }
-            Variant variant = new Variant(array);
-
-            UaVariableNode.build(getNodeContext(), builder -> {
-                builder.setNodeId(newNodeId("HelloWorld/ArrayTypes/" + name));
-                builder.setAccessLevel(AccessLevel.READ_WRITE);
-                builder.setUserAccessLevel(AccessLevel.READ_WRITE);
-                builder.setBrowseName(newQualifiedName(name));
-                builder.setDisplayName(LocalizedText.english(name));
-                builder.setDataType(typeId);
-                builder.setTypeDefinition(Identifiers.BaseDataVariableType);
-                builder.setValueRank(ValueRank.OneDimension.getValue());
-                builder.setArrayDimensions(new UInteger[]{uint(0)});
-                builder.setValue(new DataValue(variant));
-
-                builder.addAttributeFilter(new AttributeLoggingFilter(AttributeId.Value::equals));
-
-                builder.addReference(new Reference(
-                    builder.getNodeId(),
-                    Identifiers.Organizes,
-                    arrayTypesFolder.getNodeId().expanded(),
-                    Reference.Direction.INVERSE
-                ));
-
-                return builder.buildAndAdd();
-            });
-        }
-    }
-
-    private void addScalarNodes(UaFolderNode rootNode) {
-        UaFolderNode scalarTypesFolder = new UaFolderNode(
-            getNodeContext(),
-            newNodeId("HelloWorld/ScalarTypes"),
-            newQualifiedName("ScalarTypes"),
-            LocalizedText.english("ScalarTypes")
-        );
-
-        getNodeManager().addNode(scalarTypesFolder);
-        rootNode.addOrganizes(scalarTypesFolder);
-
-        for (Object[] os : STATIC_SCALAR_NODES) {
-            String name = (String) os[0];
-            NodeId typeId = (NodeId) os[1];
-            Variant variant = (Variant) os[2];
-
-            UaVariableNode node = new UaVariableNode.UaVariableNodeBuilder(getNodeContext())
-                .setNodeId(newNodeId("HelloWorld/ScalarTypes/" + name))
-                .setAccessLevel(AccessLevel.READ_WRITE)
-                .setUserAccessLevel(AccessLevel.READ_WRITE)
-                .setBrowseName(newQualifiedName(name))
-                .setDisplayName(LocalizedText.english(name))
-                .setDataType(typeId)
-                .setTypeDefinition(Identifiers.BaseDataVariableType)
-                .build();
-
-            node.setValue(new DataValue(variant));
-
-            node.getFilterChain().addLast(new AttributeLoggingFilter(AttributeId.Value::equals));
-
-            getNodeManager().addNode(node);
-            scalarTypesFolder.addOrganizes(node);
-        }
-    }
-
-    private void addWriteOnlyNodes(UaFolderNode rootNode) {
-        UaFolderNode writeOnlyFolder = new UaFolderNode(
-            getNodeContext(),
-            newNodeId("HelloWorld/WriteOnly"),
-            newQualifiedName("WriteOnly"),
-            LocalizedText.english("WriteOnly")
-        );
-
-        getNodeManager().addNode(writeOnlyFolder);
-        rootNode.addOrganizes(writeOnlyFolder);
-
-        String name = "String";
-        UaVariableNode node = new UaVariableNode.UaVariableNodeBuilder(getNodeContext())
-            .setNodeId(newNodeId("HelloWorld/WriteOnly/" + name))
-            .setAccessLevel(AccessLevel.WRITE_ONLY)
-            .setUserAccessLevel(AccessLevel.WRITE_ONLY)
-            .setBrowseName(newQualifiedName(name))
-            .setDisplayName(LocalizedText.english(name))
-            .setDataType(Identifiers.String)
-            .setTypeDefinition(Identifiers.BaseDataVariableType)
-            .build();
-
-        node.setValue(new DataValue(new Variant("can't read this")));
-
-        getNodeManager().addNode(node);
-        writeOnlyFolder.addOrganizes(node);
-    }
-
-    private void addAdminReadableNodes(UaFolderNode rootNode) {
-        UaFolderNode adminFolder = new UaFolderNode(
-            getNodeContext(),
-            newNodeId("HelloWorld/OnlyAdminCanRead"),
-            newQualifiedName("OnlyAdminCanRead"),
-            LocalizedText.english("OnlyAdminCanRead")
-        );
-
-        getNodeManager().addNode(adminFolder);
-        rootNode.addOrganizes(adminFolder);
-
-        String name = "String";
-        UaVariableNode node = new UaVariableNode.UaVariableNodeBuilder(getNodeContext())
-            .setNodeId(newNodeId("HelloWorld/OnlyAdminCanRead/" + name))
-            .setAccessLevel(AccessLevel.READ_WRITE)
-            .setBrowseName(newQualifiedName(name))
-            .setDisplayName(LocalizedText.english(name))
-            .setDataType(Identifiers.String)
-            .setTypeDefinition(Identifiers.BaseDataVariableType)
-            .build();
-
-        node.setValue(new DataValue(new Variant("shh... don't tell the lusers")));
-
-        node.getFilterChain().addLast(new RestrictedAccessFilter(identity -> {
-            if ("admin".equals(identity)) {
-                return AccessLevel.READ_WRITE;
-            } else {
-                return AccessLevel.NONE;
-            }
-        }));
-
-        getNodeManager().addNode(node);
-        adminFolder.addOrganizes(node);
-    }
-
-    private void addAdminWritableNodes(UaFolderNode rootNode) {
-        UaFolderNode adminFolder = new UaFolderNode(
-            getNodeContext(),
-            newNodeId("HelloWorld/OnlyAdminCanWrite"),
-            newQualifiedName("OnlyAdminCanWrite"),
-            LocalizedText.english("OnlyAdminCanWrite")
-        );
-
-        getNodeManager().addNode(adminFolder);
-        rootNode.addOrganizes(adminFolder);
-
-        String name = "String";
-        UaVariableNode node = new UaVariableNode.UaVariableNodeBuilder(getNodeContext())
-            .setNodeId(newNodeId("HelloWorld/OnlyAdminCanWrite/" + name))
-            .setAccessLevel(AccessLevel.READ_WRITE)
-            .setBrowseName(newQualifiedName(name))
-            .setDisplayName(LocalizedText.english(name))
-            .setDataType(Identifiers.String)
-            .setTypeDefinition(Identifiers.BaseDataVariableType)
-            .build();
-
-        node.setValue(new DataValue(new Variant("admin was here")));
-
-        node.getFilterChain().addLast(new RestrictedAccessFilter(identity -> {
-            if ("admin".equals(identity)) {
-                return AccessLevel.READ_WRITE;
-            } else {
-                return AccessLevel.READ_ONLY;
-            }
-        }));
-
-        getNodeManager().addNode(node);
-        adminFolder.addOrganizes(node);
     }
 
     private void addDynamicNodes(UaFolderNode rootNode) {
@@ -489,11 +208,25 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
             node.setValue(new DataValue(variant));
 
             node.getFilterChain().addLast(
-                new AttributeLoggingFilter(),
-                AttributeFilters.getValue(
-                    ctx ->
-                        new DataValue(new Variant(random.nextBoolean()))
-                )
+                    new AttributeLoggingFilter(),
+                    AttributeFilters.getValue(
+                        ctx ->
+                        {
+                            try {
+                                return client.readValue(
+                                        0,
+                                        TimestampsToReturn.Server,
+                                        NodeId.parse("ns=8;s=Scalar_Simulation_Boolean")
+                                ).get();
+                            } catch (InterruptedException e) {
+                                e.printStackTrace();
+                                return new DataValue(new Variant(404));
+                            } catch (ExecutionException e) {
+                                e.printStackTrace();
+                                return new DataValue(new Variant(405));
+                            }
+                        }
+                    )
             );
 
             getNodeManager().addNode(node);
@@ -521,9 +254,23 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
                 new AttributeLoggingFilter(),
                 AttributeFilters.getValue(
                     ctx ->
-                        new DataValue(new Variant(random.nextInt()))
-                )
-            );
+                    {
+                        try {
+                            return client.readValue(
+                                    0,
+                                    TimestampsToReturn.Server,
+                                    NodeId.parse("ns=8;s=Scalar_Simulation_Int16")
+                    ).get();
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                            return new DataValue(new Variant(404));
+                        } catch (ExecutionException e) {
+                            e.printStackTrace();
+                            return new DataValue(new Variant(405));
+                        }
+                    }
+            ))
+            ;
 
             getNodeManager().addNode(node);
             dynamicFolder.addOrganizes(node);
@@ -549,100 +296,28 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
             node.getFilterChain().addLast(
                 new AttributeLoggingFilter(),
                 AttributeFilters.getValue(
-                    ctx ->
-                        new DataValue(new Variant(random.nextDouble()))
+                        ctx ->
+                        {
+                            try {
+                                return client.readValue(
+                                        0,
+                                        TimestampsToReturn.Server,
+                                        NodeId.parse("ns=8;s=Scalar_Simulation_Double")
+                                ).get();
+                            } catch (InterruptedException e) {
+                                e.printStackTrace();
+                                return new DataValue(new Variant(404));
+                            } catch (ExecutionException e) {
+                                e.printStackTrace();
+                                return new DataValue(new Variant(405));
+                            }
+                        }
                 )
             );
 
             getNodeManager().addNode(node);
             dynamicFolder.addOrganizes(node);
         }
-    }
-
-    private void addDataAccessNodes(UaFolderNode rootNode) {
-        // DataAccess folder
-        UaFolderNode dataAccessFolder = new UaFolderNode(
-            getNodeContext(),
-            newNodeId("HelloWorld/DataAccess"),
-            newQualifiedName("DataAccess"),
-            LocalizedText.english("DataAccess")
-        );
-
-        getNodeManager().addNode(dataAccessFolder);
-        rootNode.addOrganizes(dataAccessFolder);
-
-        try {
-            AnalogItemTypeNode node = (AnalogItemTypeNode) getNodeFactory().createNode(
-                newNodeId("HelloWorld/DataAccess/AnalogValue"),
-                Identifiers.AnalogItemType,
-                new NodeFactory.InstantiationCallback() {
-                    @Override
-                    public boolean includeOptionalNode(NodeId typeDefinitionId, QualifiedName browseName) {
-                        return true;
-                    }
-                }
-            );
-
-            node.setBrowseName(newQualifiedName("AnalogValue"));
-            node.setDisplayName(LocalizedText.english("AnalogValue"));
-            node.setDataType(Identifiers.Double);
-            node.setValue(new DataValue(new Variant(3.14d)));
-
-            node.setEURange(new Range(0.0, 100.0));
-
-            getNodeManager().addNode(node);
-            dataAccessFolder.addOrganizes(node);
-        } catch (UaException e) {
-            logger.error("Error creating AnalogItemType instance: {}", e.getMessage(), e);
-        }
-    }
-
-    private void addSqrtMethod(UaFolderNode folderNode) {
-        UaMethodNode methodNode = UaMethodNode.builder(getNodeContext())
-            .setNodeId(newNodeId("HelloWorld/sqrt(x)"))
-            .setBrowseName(newQualifiedName("sqrt(x)"))
-            .setDisplayName(new LocalizedText(null, "sqrt(x)"))
-            .setDescription(
-                LocalizedText.english("Returns the correctly rounded positive square root of a double value."))
-            .build();
-
-        SqrtMethod sqrtMethod = new SqrtMethod(methodNode);
-        methodNode.setInputArguments(sqrtMethod.getInputArguments());
-        methodNode.setOutputArguments(sqrtMethod.getOutputArguments());
-        methodNode.setInvocationHandler(sqrtMethod);
-
-        getNodeManager().addNode(methodNode);
-
-        methodNode.addReference(new Reference(
-            methodNode.getNodeId(),
-            Identifiers.HasComponent,
-            folderNode.getNodeId().expanded(),
-            false
-        ));
-    }
-
-    private void addGenerateEventMethod(UaFolderNode folderNode) {
-        UaMethodNode methodNode = UaMethodNode.builder(getNodeContext())
-            .setNodeId(newNodeId("HelloWorld/generateEvent(eventTypeId)"))
-            .setBrowseName(newQualifiedName("generateEvent(eventTypeId)"))
-            .setDisplayName(new LocalizedText(null, "generateEvent(eventTypeId)"))
-            .setDescription(
-                LocalizedText.english("Generate an Event with the TypeDefinition indicated by eventTypeId."))
-            .build();
-
-        GenerateEventMethod generateEventMethod = new GenerateEventMethod(methodNode);
-        methodNode.setInputArguments(generateEventMethod.getInputArguments());
-        methodNode.setOutputArguments(generateEventMethod.getOutputArguments());
-        methodNode.setInvocationHandler(generateEventMethod);
-
-        getNodeManager().addNode(methodNode);
-
-        methodNode.addReference(new Reference(
-            methodNode.getNodeId(),
-            Identifiers.HasComponent,
-            folderNode.getNodeId().expanded(),
-            false
-        ));
     }
 
     private void addCustomObjectTypeAndInstance(UaFolderNode rootFolder) {
@@ -737,270 +412,6 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
         } catch (UaException e) {
             logger.error("Error creating MyObjectType instance: {}", e.getMessage(), e);
         }
-    }
-
-    private void registerCustomEnumType() throws Exception {
-        NodeId dataTypeId = CustomEnumType.TYPE_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        dictionaryManager.registerEnumCodec(
-            new CustomEnumType.Codec().asBinaryCodec(),
-            "CustomEnumType",
-            dataTypeId
-        );
-
-        EnumField[] fields = new EnumField[]{
-            new EnumField(
-                0L,
-                LocalizedText.english("Field0"),
-                LocalizedText.NULL_VALUE,
-                "Field0"
-            ),
-            new EnumField(
-                1L,
-                LocalizedText.english("Field1"),
-                LocalizedText.NULL_VALUE,
-                "Field1"
-            ),
-            new EnumField(
-                2L,
-                LocalizedText.english("Field2"),
-                LocalizedText.NULL_VALUE,
-                "Field2"
-            )
-        };
-
-        EnumDefinition definition = new EnumDefinition(fields);
-
-        EnumDescription description = new EnumDescription(
-            dataTypeId,
-            new QualifiedName(getNamespaceIndex(), "CustomEnumType"),
-            definition,
-            ubyte(BuiltinDataType.Int32.getTypeId())
-        );
-
-        dictionaryManager.registerEnumDescription(description);
-    }
-
-    private void registerCustomStructType() throws Exception {
-        // Get the NodeId for the DataType and encoding Nodes.
-
-        NodeId dataTypeId = CustomStructType.TYPE_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        NodeId binaryEncodingId = CustomStructType.BINARY_ENCODING_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        // At a minimum, custom types must have their codec registered.
-        // If clients don't need to dynamically discover types and will
-        // register the codecs on their own then this is all that is
-        // necessary.
-        // The dictionary manager will add a corresponding DataType Node to
-        // the AddressSpace.
-
-        dictionaryManager.registerStructureCodec(
-            new CustomStructType.Codec().asBinaryCodec(),
-            "CustomStructType",
-            dataTypeId,
-            binaryEncodingId
-        );
-
-        // If the custom type also needs to be discoverable by clients then it
-        // needs an entry in a DataTypeDictionary that can be read by those
-        // clients. We describe the type using StructureDefinition or
-        // EnumDefinition and register it with the dictionary manager.
-        // The dictionary manager will add all the necessary nodes to the
-        // AddressSpace and generate the required dictionary bsd.xml file.
-
-        StructureField[] fields = new StructureField[]{
-            new StructureField(
-                "foo",
-                LocalizedText.NULL_VALUE,
-                Identifiers.String,
-                ValueRanks.Scalar,
-                null,
-                getServer().getConfig().getLimits().getMaxStringLength(),
-                false
-            ),
-            new StructureField(
-                "bar",
-                LocalizedText.NULL_VALUE,
-                Identifiers.UInt32,
-                ValueRanks.Scalar,
-                null,
-                uint(0),
-                false
-            ),
-            new StructureField(
-                "baz",
-                LocalizedText.NULL_VALUE,
-                Identifiers.Boolean,
-                ValueRanks.Scalar,
-                null,
-                uint(0),
-                false
-            )
-        };
-
-        StructureDefinition definition = new StructureDefinition(
-            binaryEncodingId,
-            Identifiers.Structure,
-            StructureType.Structure,
-            fields
-        );
-
-        StructureDescription description = new StructureDescription(
-            dataTypeId,
-            new QualifiedName(getNamespaceIndex(), "CustomStructType"),
-            definition
-        );
-
-        dictionaryManager.registerStructureDescription(description, binaryEncodingId);
-    }
-
-    private void registerCustomUnionType() throws Exception {
-        NodeId dataTypeId = CustomUnionType.TYPE_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        NodeId binaryEncodingId = CustomUnionType.BINARY_ENCODING_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        dictionaryManager.registerUnionCodec(
-            new CustomUnionType.Codec().asBinaryCodec(),
-            "CustomUnionType",
-            dataTypeId,
-            binaryEncodingId
-        );
-
-        StructureField[] fields = new StructureField[]{
-            new StructureField(
-                "foo",
-                LocalizedText.NULL_VALUE,
-                Identifiers.UInt32,
-                ValueRanks.Scalar,
-                null,
-                getServer().getConfig().getLimits().getMaxStringLength(),
-                false
-            ),
-            new StructureField(
-                "bar",
-                LocalizedText.NULL_VALUE,
-                Identifiers.String,
-                ValueRanks.Scalar,
-                null,
-                uint(0),
-                false
-            )
-        };
-
-        StructureDefinition definition = new StructureDefinition(
-            binaryEncodingId,
-            Identifiers.Structure,
-            StructureType.Union,
-            fields
-        );
-
-        StructureDescription description = new StructureDescription(
-            dataTypeId,
-            new QualifiedName(getNamespaceIndex(), "CustomUnionType"),
-            definition
-        );
-
-        dictionaryManager.registerStructureDescription(description, binaryEncodingId);
-    }
-
-    private void addCustomEnumTypeVariable(UaFolderNode rootFolder) throws Exception {
-        NodeId dataTypeId = CustomEnumType.TYPE_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        UaVariableNode customEnumTypeVariable = UaVariableNode.builder(getNodeContext())
-            .setNodeId(newNodeId("HelloWorld/CustomEnumTypeVariable"))
-            .setAccessLevel(AccessLevel.READ_WRITE)
-            .setUserAccessLevel(AccessLevel.READ_WRITE)
-            .setBrowseName(newQualifiedName("CustomEnumTypeVariable"))
-            .setDisplayName(LocalizedText.english("CustomEnumTypeVariable"))
-            .setDataType(dataTypeId)
-            .setTypeDefinition(Identifiers.BaseDataVariableType)
-            .build();
-
-        customEnumTypeVariable.setValue(new DataValue(new Variant(CustomEnumType.Field1)));
-
-        getNodeManager().addNode(customEnumTypeVariable);
-
-        customEnumTypeVariable.addReference(new Reference(
-            customEnumTypeVariable.getNodeId(),
-            Identifiers.Organizes,
-            rootFolder.getNodeId().expanded(),
-            false
-        ));
-    }
-
-    private void addCustomStructTypeVariable(UaFolderNode rootFolder) throws Exception {
-        NodeId dataTypeId = CustomStructType.TYPE_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        NodeId binaryEncodingId = CustomStructType.BINARY_ENCODING_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        UaVariableNode customStructTypeVariable = UaVariableNode.builder(getNodeContext())
-            .setNodeId(newNodeId("HelloWorld/CustomStructTypeVariable"))
-            .setAccessLevel(AccessLevel.READ_WRITE)
-            .setUserAccessLevel(AccessLevel.READ_WRITE)
-            .setBrowseName(newQualifiedName("CustomStructTypeVariable"))
-            .setDisplayName(LocalizedText.english("CustomStructTypeVariable"))
-            .setDataType(dataTypeId)
-            .setTypeDefinition(Identifiers.BaseDataVariableType)
-            .build();
-
-        CustomStructType value = new CustomStructType(
-            "foo",
-            uint(42),
-            true
-        );
-
-        ExtensionObject xo = ExtensionObject.encodeDefaultBinary(
-            getServer().getSerializationContext(),
-            value,
-            binaryEncodingId
-        );
-
-        customStructTypeVariable.setValue(new DataValue(new Variant(xo)));
-
-        getNodeManager().addNode(customStructTypeVariable);
-
-        customStructTypeVariable.addReference(new Reference(
-            customStructTypeVariable.getNodeId(),
-            Identifiers.Organizes,
-            rootFolder.getNodeId().expanded(),
-            false
-        ));
-    }
-
-    private void addCustomUnionTypeVariable(UaFolderNode rootFolder) throws Exception {
-        NodeId dataTypeId = CustomUnionType.TYPE_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        NodeId binaryEncodingId = CustomUnionType.BINARY_ENCODING_ID.toNodeIdOrThrow(getServer().getNamespaceTable());
-
-        UaVariableNode customUnionTypeVariable = UaVariableNode.builder(getNodeContext())
-            .setNodeId(newNodeId("HelloWorld/CustomUnionTypeVariable"))
-            .setAccessLevel(AccessLevel.READ_WRITE)
-            .setUserAccessLevel(AccessLevel.READ_WRITE)
-            .setBrowseName(newQualifiedName("CustomUnionTypeVariable"))
-            .setDisplayName(LocalizedText.english("CustomUnionTypeVariable"))
-            .setDataType(dataTypeId)
-            .setTypeDefinition(Identifiers.BaseDataVariableType)
-            .build();
-
-        CustomUnionType value = CustomUnionType.ofBar("hello");
-
-        ExtensionObject xo = ExtensionObject.encodeDefaultBinary(
-            getServer().getSerializationContext(),
-            value,
-            binaryEncodingId
-        );
-
-        customUnionTypeVariable.setValue(new DataValue(new Variant(xo)));
-
-        getNodeManager().addNode(customUnionTypeVariable);
-
-        customUnionTypeVariable.addReference(new Reference(
-            customUnionTypeVariable.getNodeId(),
-            Identifiers.Organizes,
-            rootFolder.getNodeId().expanded(),
-            false
-        ));
     }
 
     @Override
