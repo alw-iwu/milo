@@ -61,7 +61,7 @@ public class ExampleServer {
 
     private static final int TCP_BIND_PORT = 12686;
     private static final int HTTPS_BIND_PORT = 8443;
-    private static final String CLIENT_TCP_ENDPOINT = "opc.tcp://opcuademo.sterfive.com:26543";
+    private static final String CLIENT_TCP_ENDPOINT = "opc.tcp://milo.digitalpetri.com:62541/milo";
 
     static {
         // Required for SecurityPolicy.Aes256_Sha256_RsaPss

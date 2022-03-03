@@ -216,7 +216,7 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
                                 return client.readValue(
                                         0,
                                         TimestampsToReturn.Server,
-                                        NodeId.parse("ns=8;s=Scalar_Simulation_Boolean")
+                                        NodeId.parse("ns=2;s=NullValues/Boolean")
                                 ).get();
                             } catch (InterruptedException e) {
                                 e.printStackTrace();
@@ -259,7 +259,7 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
                             return client.readValue(
                                     0,
                                     TimestampsToReturn.Server,
-                                    NodeId.parse("ns=8;s=Scalar_Simulation_Int16")
+                                    NodeId.parse("ns=2;s=Dynamic/RandomInt32")
                     ).get();
                         } catch (InterruptedException e) {
                             e.printStackTrace();
@@ -302,7 +302,7 @@ public class ExampleNamespace extends ManagedNamespaceWithLifecycle {
                                 return client.readValue(
                                         0,
                                         TimestampsToReturn.Server,
-                                        NodeId.parse("ns=8;s=Scalar_Simulation_Double")
+                                        NodeId.parse("ns=2;s=Dynamic/RandomDouble")
                                 ).get();
                             } catch (InterruptedException e) {
                                 e.printStackTrace();

@@ -29,7 +29,7 @@ public class BrowseAsyncExample implements ClientExample {
     public static void main(String[] args) throws Exception {
         BrowseAsyncExample example = new BrowseAsyncExample();
 
-        new ClientExampleRunner(example).run();
+        new ClientExampleRunner(example, false).run();
     }
 
     private final Logger logger = LoggerFactory.getLogger(getClass());
@@ -83,6 +83,11 @@ public class BrowseAsyncExample implements ClientExample {
         consumer.accept(depth, tree.node);
 
         tree.children.forEach(child -> traverse(child, depth + 1, consumer));
+    }
+
+    @Override
+    public String getEndpointUrl(){
+        return "opc.tcp://127.0.0.1:4840/freeopcua/server/";
     }
 
     private static class Tree<T> {
